@@ -242,6 +242,7 @@ def _seed_multi_shot_project(tmp_path):
         'local': local,
         'projects': projects,
         'models': models,
+        'self_hosted_video': self_hosted_video,
         'project_id': project_id,
         'ref_item_id': ref_item_id,
         'ready_spec_id': ready_spec_id,
@@ -461,3 +462,114 @@ async def test_generation_precheck_has_zero_side_effects_and_localizes_errors(tm
     assert after_snapshot == before_snapshot
     assert len(after_history) == len(before_history)
     assert after_snapshot.jobs == ()
+
+
+def test_summary_includes_models_and_precheck_matches_submission_output_rules(tmp_path):
+    from opendirector.application.creation_generation import CreationGeneration
+    from opendirector.domain.creation.validation import ContractError
+    from opendirector.domain.projects import ProjectError
+
+    ctx = _seed_multi_shot_project(tmp_path)
+    projects = ctx['projects']
+    models = ctx['models']
+    project_id = ctx['project_id']
+    api = TestClient(create_app(ctx['local']), headers={'X-OpenDirector-Request': '1'})
+
+    summary = api.post(
+        f'/api/creation/projects/{project_id}/queries',
+        json={'type': 'project.get', 'projectId': str(project_id), 'queryId': str(uuid4()), 'view': 'summary'},
+    ).json()
+    assert isinstance(summary.get('models'), list) and len(summary['models']) >= 2
+    assert all('apiKey' not in model for model in summary['models'])
+
+    # Configure a tool-only segmentation model for precheck vs submit parity.
+    seg_model = models.save(
+        'image', 'http://127.0.0.1:19999/v1', 'SAM2-Segmentation', '',
+        connection_type='self_hosted', protocol='vllm_omni_segmentation', auth_mode='none',
+    )['id']
+
+    session = str(uuid4())
+    projects.open(project_id, session)
+
+    # 1. Tool-only segmentation model bound to an image generation spec
+    seg_spec_id, seg_item_id = uuid4(), uuid4()
+    projects.execute(parse_command({
+        'type': 'canvas.createGeneration',
+        'projectId': project_id,
+        'commandId': uuid4(),
+        'payload': {
+            'spec': {
+                'id': str(seg_spec_id), 'projectId': str(project_id), 'kind': 'image',
+                'purpose': 'generation', 'modelConfigId': seg_model, 'prompt': 'Segment subject', 'parameters': {},
+            },
+            'item': {
+                'id': str(seg_item_id), 'projectId': str(project_id), 'kind': 'image',
+                'position': {'x': 900, 'y': 0},
+                'binding': {'role': 'generation', 'objectRef': {'id': str(seg_spec_id)}},
+            },
+            'references': [],
+        },
+    }), session=session)
+
+    # 2. Video spec requesting unsupported explicit output resolution on vLLM-Omni H3
+    bad_res_spec_id, bad_res_item_id = uuid4(), uuid4()
+    projects.execute(parse_command({
+        'type': 'canvas.createGeneration',
+        'projectId': project_id,
+        'commandId': uuid4(),
+        'payload': {
+            'spec': {
+                'id': str(bad_res_spec_id), 'projectId': str(project_id), 'kind': 'video',
+                'purpose': 'generation', 'modelConfigId': ctx['self_hosted_video'],
+                'prompt': 'Wide shot alley',
+                'parameters': {'videoMode': 'first_frame', 'durationSeconds': 5, 'resolution': '4K'},
+            },
+            'item': {
+                'id': str(bad_res_item_id), 'projectId': str(project_id), 'kind': 'video',
+                'position': {'x': 900, 'y': 260},
+                'binding': {'role': 'generation', 'objectRef': {'id': str(bad_res_spec_id)}},
+            },
+            'references': [],
+        },
+    }), session=session)
+
+    # Precheck must reject both specs for the exact same reason formal submission rejects them.
+    report = api.post(
+        f'/api/creation/projects/{project_id}/queries',
+        json={
+            'type': 'generation.precheck', 'projectId': str(project_id),
+            'queryId': str(uuid4()), 'specIds': [str(seg_spec_id), str(bad_res_spec_id)],
+        },
+    ).json()
+    assert report['readySpecs'] == 0
+    assert report['blockedSpecs'] == 2
+    by_spec = {entry['specId']: entry for entry in report['items']}
+    assert '分割' in by_spec[str(seg_spec_id)]['issues'][0]['message']
+    assert '分辨率' in by_spec[str(bad_res_spec_id)]['issues'][0]['message']
+
+    gen_service = CreationGeneration(projects, models)
+    for blocked_spec, origin_item in ((seg_spec_id, seg_item_id), (bad_res_spec_id, bad_res_item_id)):
+        expected_msg = by_spec[str(blocked_spec)]['issues'][0]['message']
+        try:
+            submit_receipt = gen_service.prepare(parse_command({
+                'type': 'generation.submit',
+                'projectId': project_id,
+                'commandId': uuid4(),
+                'expectedVersions': [
+                    {'objectType': 'generation_spec', 'id': str(blocked_spec), 'revision': 1},
+                    {'objectType': 'canvas_item', 'id': str(origin_item), 'revision': 1},
+                ],
+                'payload': {
+                    'specId': str(blocked_spec),
+                    'originItemId': str(origin_item),
+                    'expectedSpecRevision': 1,
+                },
+            }), session=session)
+            assert submit_receipt.status == 'rejected'
+            assert submit_receipt.issues[0].message == expected_msg
+        except ContractError as err:
+            assert err.issue.message == expected_msg
+        except ProjectError as err:
+            assert str(err) == expected_msg
+
+    projects.local.release(session)

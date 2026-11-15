@@ -42,25 +42,39 @@ def normalize_usage(raw: object) -> dict[str, int] | None:
     total = _token_count(raw.get("total_tokens"))
     if total is None and prompt is not None and completion is not None:
         total = prompt + completion
-    if prompt is None and completion is None and total is None:
-        return None
 
     prompt_details = raw.get("prompt_tokens_details")
     if not isinstance(prompt_details, dict):
+        prompt_details = raw.get("input_tokens_details")
+    if not isinstance(prompt_details, dict):
         prompt_details = {}
     completion_details = raw.get("completion_tokens_details")
+    if not isinstance(completion_details, dict):
+        completion_details = raw.get("output_tokens_details")
     if not isinstance(completion_details, dict):
         completion_details = {}
 
     cached = _token_count(prompt_details.get("cached_tokens"))
     if cached is None:
         cached = _token_count(raw.get("prompt_cache_hit_tokens"))
+    if cached is None:
+        cached = _token_count(raw.get("cache_read_input_tokens"))
+    cache_write = _token_count(raw.get("cache_creation_input_tokens"))
     cache_miss = _token_count(raw.get("prompt_cache_miss_tokens"))
     if cache_miss is None and prompt is not None and cached is not None:
         cache_miss = max(0, prompt - cached)
     reasoning = _token_count(completion_details.get("reasoning_tokens"))
     if reasoning is None:
         reasoning = _token_count(raw.get("reasoning_tokens"))
+
+    if (
+        prompt is None
+        and completion is None
+        and total is None
+        and cached is None
+        and cache_write is None
+    ):
+        return None
 
     usage: dict[str, int] = {}
     if prompt is not None:
@@ -71,11 +85,29 @@ def normalize_usage(raw: object) -> dict[str, int] | None:
         usage["totalTokens"] = total
     if cached is not None:
         usage["cachedPromptTokens"] = cached
+    if cache_write is not None:
+        usage["cacheWritePromptTokens"] = cache_write
     if cache_miss is not None:
         usage["cacheMissPromptTokens"] = cache_miss
     if reasoning is not None:
         usage["reasoningTokens"] = reasoning
     return usage
+
+
+def _merge_usage(previous: dict[str, int] | None, observed: dict[str, int] | None) -> dict[str, int] | None:
+    if observed is None:
+        return previous
+    if previous is None:
+        return dict(observed)
+    merged = {**previous, **observed}
+    prompt = merged.get("promptTokens")
+    completion = merged.get("completionTokens")
+    if prompt is not None and completion is not None and "totalTokens" not in observed:
+        merged["totalTokens"] = max(merged.get("totalTokens", 0), prompt + completion)
+    cached = merged.get("cachedPromptTokens")
+    if prompt is not None and cached is not None and "cacheMissPromptTokens" not in observed:
+        merged["cacheMissPromptTokens"] = max(0, prompt - cached)
+    return merged
 
 
 class ModelGateway:
@@ -99,6 +131,7 @@ class ModelGateway:
             "completionTokens": 0,
             "totalTokens": 0,
             "cachedPromptTokens": 0,
+            "cacheWritePromptTokens": 0,
             "reasoningTokens": 0,
         }
 
@@ -284,8 +317,7 @@ class ModelGateway:
                                     event_lines.clear()
                                     if data != "[DONE]":
                                         observed = self.trace_reasoning(request_id, data)
-                                        if observed is not None:
-                                            usage = observed
+                                        usage = _merge_usage(usage, observed)
                         if is_sse:
                             buffer += decoder.decode(b"", final=True)
                             for line in buffer.splitlines():
@@ -297,8 +329,7 @@ class ModelGateway:
                                 event_lines.clear()
                                 if data != "[DONE]":
                                     observed = self.trace_reasoning(request_id, data)
-                                    if observed is not None:
-                                        usage = observed
+                                    usage = _merge_usage(usage, observed)
                         elif json_body:
                             with suppress(UnicodeDecodeError, json.JSONDecodeError):
                                 parsed = json.loads(json_body.decode("utf-8"))
