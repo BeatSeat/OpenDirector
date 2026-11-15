@@ -136,22 +136,90 @@ _DIALOGUE_BLOCK_RE = re.compile(r"<d>(.*?)</d>", re.S)
 _DIALOGUE_LANG_RE = re.compile(r"^\s*\[[^\[\]\n]+\]\s+\S", re.S)
 _TAG_RE = re.compile(r"<(Subject|Picture|Video|Audio) (\d+)>")
 _ABSTRACT_TAG_RE = re.compile(r"\b(?:8k|4k\s*uhd|masterpiece|best quality|unreal engine|photorealistic|trending on artstation)\b", re.I)
+_PSEUDO_PARAM_RE = re.compile(
+    r"(?:(?<!\w)--(?:ar|aspect|v|version|fps|cfg|seed|steps|stylize|chaos|q|quality|iw|no)\b"
+    r"|<lora:[^>\n]+>"
+    r"|\([A-Za-z0-9 _-]+:\d+(?:\.\d+)?\)"
+    r"|\b(?:cfg_scale|num_frames|guidance_scale|fps|aspect_ratio)\s*=\s*\S+)",
+    re.I,
+)
+
+OPPOSING_CAMERA_MOTIONS: tuple[tuple[str, str], ...] = (
+    ("Zoom In", "Zoom Out"),
+    ("Push In", "Pull Out"),
+    ("Pan Left", "Pan Right"),
+    ("Truck Left", "Truck Right"),
+    ("Tilt Up", "Tilt Down"),
+    ("Pedestal Up", "Pedestal Down"),
+    ("Roll Clockwise", "Roll Counterclockwise"),
+    ("Shake Slightly", "Shake Strongly"),
+)
+MOVING_CAMERA_MOTIONS: frozenset[str] = frozenset(
+    key for key in CAMERA_MOTIONS if key not in {"Static Shot", "POV"}
+)
+
+_CAMERA_MOTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (
+        canonical,
+        re.compile(
+            r"(?<![A-Za-z])(?:"
+            + "|".join(
+                re.escape(phrase)
+                for phrase in sorted({canonical, verb}, key=len, reverse=True)
+            )
+            + r")(?![A-Za-z])",
+            re.I,
+        ),
+    )
+    for canonical, verb in sorted(
+        CAMERA_MOTIONS.items(),
+        key=lambda item: max(len(item[0]), len(item[1])),
+        reverse=True,
+    )
+)
+
+
+def strip_dialogue_blocks(text: str) -> str:
+    """Replace verbatim <d>...</d> spoken lines with spaces before structural scanning."""
+    return _DIALOGUE_BLOCK_RE.sub(" ", text or "")
+
+
+def detect_camera_motions(text: str) -> list[str]:
+    """Return canonical H3 camera motions detected outside dialogue blocks in appearance order."""
+    scrubbed = strip_dialogue_blocks(text)
+    hits: list[tuple[int, str]] = []
+    occupied: list[tuple[int, int]] = []
+    for canonical, pattern in _CAMERA_MOTION_PATTERNS:
+        for match in pattern.finditer(scrubbed):
+            start, end = match.span()
+            if any(not (end <= s or start >= e) for s, e in occupied):
+                continue
+            occupied.append((start, end))
+            hits.append((start, canonical))
+    hits.sort(key=lambda pair: pair[0])
+    ordered: list[str] = []
+    for _, canonical in hits:
+        if canonical not in ordered:
+            ordered.append(canonical)
+    return ordered
 
 
 def h3_frame_grid(duration_seconds: float, fps: int = H3_DEFAULT_FPS) -> dict[str, int | float]:
     """Compute H3's 17n+5 latent frame grid for a 4-15s clip."""
     seconds = float(duration_seconds)
     if not H3_MIN_DURATION <= seconds <= H3_MAX_DURATION:
-        raise ProjectError(f"MiniMax-H3 duration must be between {H3_MIN_DURATION:g} and {H3_MAX_DURATION:g} seconds.")
+        raise ProjectError(f"MiniMax-H3 视频时长必须在 {H3_MIN_DURATION:g} 到 {H3_MAX_DURATION:g} 秒之间。", 422)
     if fps <= 0:
-        raise ProjectError("FPS must be positive.")
+        raise ProjectError("帧率必须大于 0。", 422)
     requested = round(seconds * fps)
     frames = requested + (5 - requested) % 17
+    vllm_omni_frames = 17 * min(max(round((seconds * fps - 5) / 17), 6), 20) + 5
     return {
         "durationSeconds": round(seconds, 4),
         "fps": fps,
         "requestedFrames": requested,
         "gridFrames": frames,
+        "vllmOmniFrames": vllm_omni_frames,
         "effectiveGridSeconds": round(frames / fps, 4),
     }
 
@@ -160,16 +228,27 @@ def h3_reference_ordinals(sources: list[dict[str, Any]] | tuple[dict[str, Any], 
     """Compute H3 per-modality tags matching fasth3.native_prompt's audio offset.
 
     FastH3 reserves `<Audio 1..K>` for embedded soundtracks of reference videos
-    (`hasAudio=True`) in source order before numbering standalone audio files.
+    (`hasAudio=True`) in source order before numbering standalone audio files, and
+    `CreationGeneration.task` deduplicates transmitted references by `assetId`.
     """
+    deduped: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in sources:
+        raw_id = str(item.get("id") or "")
+        if raw_id:
+            if raw_id in seen_ids:
+                continue
+            seen_ids.add(raw_id)
+        deduped.append(item)
+
     audio_offset = sum(
         item.get("kind") == "video" and bool(item.get("hasAudio"))
-        for item in sources
+        for item in deduped
     )
     counts: dict[str, int] = {}
     embedded_audio_index = 0
     assigned: list[dict[str, Any]] = []
-    for item in sources:
+    for item in deduped:
         kind = str(item.get("kind") or "")
         counts[kind] = counts.get(kind, 0) + 1
         tag = None
@@ -515,6 +594,21 @@ def lint_h3_prompt(
                     errors.append(f"[Shot {idx}] cut time ({seconds:.3f}s) must fall strictly within duration ({duration_seconds:.2f}s).")
                 last_cut = seconds
 
+        segment_motions = set(detect_camera_motions(segment))
+        for first_motion, second_motion in OPPOSING_CAMERA_MOTIONS:
+            if first_motion in segment_motions and second_motion in segment_motions:
+                errors.append(
+                    f"[Shot {idx}] combines contradictory camera motions ({first_motion} vs {second_motion}); "
+                    "split opposing movements across separate shots."
+                )
+        if "Static Shot" in segment_motions:
+            moving = sorted(segment_motions & MOVING_CAMERA_MOTIONS)
+            if moving:
+                errors.append(
+                    f"[Shot {idx}] combines 'Static Shot' with moving camera instruction(s) {moving}; "
+                    "add a cut timestamp before moving the camera."
+                )
+
     final_shot = max(len(shot_numbers), 1)
     expected_header = _alignment_instruction(normalized_mode, final_shot, float(duration_seconds))
     first_line = prompt.splitlines()[0].strip() if prompt.splitlines() else ""
@@ -533,7 +627,14 @@ def lint_h3_prompt(
     if "says in an off-screen voiceover" in shot_body and "lips remain" not in shot_body:
         warnings.append("Off-screen voiceover should explicitly state after </d> that the on-screen character's lips remain closed.")
 
-    if _ABSTRACT_TAG_RE.search(prompt):
+    scrubbed_prompt = strip_dialogue_blocks(prompt)
+    pseudo_matches = sorted({m.group(0).strip() for m in _PSEUDO_PARAM_RE.finditer(scrubbed_prompt)})
+    if pseudo_matches:
+        errors.append(
+            f"Prompt contains unsupported pseudo-parameter tag(s) {pseudo_matches}; "
+            "pass aspect ratio, duration, and resolution via structured GenerationSpec parameters instead."
+        )
+    if _ABSTRACT_TAG_RE.search(scrubbed_prompt):
         warnings.append("Avoid stacked quality buzzwords (e.g. '8k', 'masterpiece', 'unreal engine'); describe concrete visual and acoustic facts.")
 
     for audio_sec in ("overall_soundscape", "non_diegetic_music"):

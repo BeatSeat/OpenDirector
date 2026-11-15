@@ -2,9 +2,10 @@
 from io import BytesIO
 import json
 from pathlib import Path
-import shutil
 import subprocess
 from uuid import uuid4
+
+from capabilities import requires_ffmpeg
 
 from fastapi.testclient import TestClient
 import httpx
@@ -696,7 +697,7 @@ def test_cli_h3_workflow_inspect_shot_and_surgical_timeline_revise(tmp_path, mon
     assert final_clips[2].resource.asset.assetId == img_s3.id
 
 
-@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="Requires local ffmpeg/ffprobe")
+@requires_ffmpeg()
 def test_real_ffmpeg_shot_inspection(tmp_path):
     from opendirector.media.shot_inspection import inspect_video_shot
 
@@ -888,3 +889,298 @@ async def test_tool_gateway_storyboard_audit_and_video_contact_sheet_preview(tmp
         assert audit_call.value["gate"]["requiresUserApproval"] is True
     finally:
         await gateway.close()
+
+
+def test_lint_contradictory_motions_pseudo_params_and_fractional_17k5():
+    from opendirector.application.creation_storyboard import extract_prompt_shot_features
+
+    # 1. Exact 17k+5 fractional frame duration (158 / 24 = 6.583333s) compiles cleanly and exposes vllmOmniFrames
+    fractional_duration = round(158 / 24, 6)
+    compiled = compile_h3_prompt({
+        "mode": "i2va",
+        "durationSeconds": fractional_duration,
+        "shots": [{
+            "shotSize": "medium close-up",
+            "description": "<Picture 1> turns toward the window",
+            "cameraMotion": "Pull Out",
+            "cameraAmplitude": "small",
+            "cameraSpeed": "slow",
+            "dialogues": [{
+                "speakerId": "S1",
+                "speakerIntro": "The detective",
+                "language": "English",
+                "text": "Push in the latch and pull out the drawer --ar 16:9.",
+            }],
+        }],
+        "overallSoundscape": "Quiet rain on window glass.",
+        "nonDiegeticMusic": "N/A",
+    })
+    assert compiled["lint"]["valid"] is True, compiled["lint"]
+    assert compiled["frameGrid"]["vllmOmniFrames"] == 158
+    features = extract_prompt_shot_features(compiled["prompt"])
+    assert features == {"shotSize": "medium close-up", "cameraMotion": "Pull Out"}
+
+    # 2. Contradictory camera motions and pseudo-parameter flags outside dialogue are rejected
+    contradictory = (
+        "integrated_multimodal_description: [Shot 1] Live-action, a wide shot: The courier walks across the alley. "
+        "The camera pushes in slowly and then pulls out with large amplitude --ar 16:9 cfg_scale=7.\n\n"
+        "overall_soundscape: Distant traffic.\n\n"
+        "non_diegetic_music: N/A"
+    )
+    bad_lint = lint_h3_prompt(contradictory, mode="t2va", duration_seconds=5.0)
+    assert bad_lint["valid"] is False
+    joined_errors = " | ".join(bad_lint["errors"])
+    assert "contradictory camera motions (Push In vs Pull Out)" in joined_errors
+    assert "pseudo-parameter tag(s)" in joined_errors
+
+    static_plus_pan = (
+        "integrated_multimodal_description: [Shot 1] Live-action, a close-up: The watch ticks. "
+        "The camera holds a static shot while it pans left across the desk.\n\n"
+        "overall_soundscape: Soft ticking.\n\n"
+        "non_diegetic_music: N/A"
+    )
+    static_lint = lint_h3_prompt(static_plus_pan, mode="t2va", duration_seconds=5.0)
+    assert static_lint["valid"] is False
+    assert any("Static Shot" in err for err in static_lint["errors"])
+
+
+def test_storyboard_audit_group_visibility_ordinal_policy_and_query_contract(tmp_path):
+    from pydantic import TypeAdapter, ValidationError
+    from opendirector.application.creation_storyboard import (
+        audit_project_storyboard,
+        prepare_timeline_shot_revision,
+        resolve_h3_spec_reference_sources,
+    )
+    from opendirector.domain.creation.commands import Query
+
+    query_adapter = TypeAdapter(Query)
+    g_id, tl_id, s_id = uuid4(), uuid4(), uuid4()
+    with pytest.raises(ValidationError):
+        query_adapter.validate_python({
+            "type": "storyboard.audit",
+            "projectId": str(uuid4()),
+            "queryId": str(uuid4()),
+            "timelineEditorId": str(tl_id),
+            "groupId": str(g_id),
+        })
+    with pytest.raises(ValidationError):
+        query_adapter.validate_python({
+            "type": "storyboard.audit",
+            "projectId": str(uuid4()),
+            "queryId": str(uuid4()),
+            "specIds": [str(s_id), str(s_id)],
+        })
+
+    local = LocalProjects(tmp_path)
+    projects = CreationProjects(local)
+    models = ModelConfigs(tmp_path)
+    model_id = models.save(
+        "video", "http://127.0.0.1:19999/v1", "MiniMax-H3", "",
+        connection_type="self_hosted", protocol="vllm_omni", auth_mode="none",
+    )["id"]
+
+    project_id = uuid4()
+    session = str(uuid4())
+    projects.execute(parse_command({
+        "type": "project.create",
+        "projectId": project_id,
+        "commandId": uuid4(),
+        "payload": {"name": "Policy & Group Audit"},
+    }))
+    projects.open(project_id, session)
+
+    img_a = _stage_and_import(projects, project_id, session, "a.png", "image", _png_bytes((10, 40, 90)))
+    img_b = _stage_and_import(projects, project_id, session, "b.png", "image", _png_bytes((90, 40, 10)))
+
+    # 1. Reference policy parity: in first_frame mode, a non-frame 'reference' image is context_only and excluded
+    #    from H3 media ordinals, and duplicate asset references collapse to a single <Picture 1>.
+    spec_ff, item_ff = uuid4(), uuid4()
+    ref_frame_id, ref_extra_id = uuid4(), uuid4()
+    projects.execute(parse_command({
+        "type": "canvas.createGeneration",
+        "projectId": project_id,
+        "commandId": uuid4(),
+        "payload": {
+            "spec": {
+                "id": str(spec_ff),
+                "projectId": str(project_id),
+                "kind": "video",
+                "purpose": "generation",
+                "modelConfigId": model_id,
+                "prompt": compile_h3_prompt({
+                    "mode": "i2va",
+                    "durationSeconds": 5.0,
+                    "shots": [{
+                        "shotSize": "wide shot",
+                        "description": "<Picture 1> opens the scene under warm streetlamps",
+                        "cameraMotion": "Push In",
+                    }],
+                })["prompt"],
+                "parameters": {"videoMode": "first_frame", "durationSeconds": 5},
+            },
+            "item": {
+                "id": str(item_ff),
+                "projectId": str(project_id),
+                "kind": "video",
+                "position": {"x": 0, "y": 0},
+                "binding": {"role": "generation", "objectRef": {"id": str(spec_ff)}},
+            },
+            "references": [
+                {
+                    "id": str(ref_extra_id),
+                    "projectId": str(project_id),
+                    "targetSpecId": str(spec_ff),
+                    "role": "reference",
+                    "order": 0,
+                    "binding": "pinned",
+                    "source": {"assetId": str(img_b.id), "revision": img_b.revision, "fingerprint": img_b.fingerprint, "kind": "image"},
+                },
+                {
+                    "id": str(ref_frame_id),
+                    "projectId": str(project_id),
+                    "targetSpecId": str(spec_ff),
+                    "role": "first_frame",
+                    "order": 1,
+                    "binding": "pinned",
+                    "source": {"assetId": str(img_a.id), "revision": img_a.revision, "fingerprint": img_a.fingerprint, "kind": "image"},
+                },
+            ],
+        },
+    }), session=session)
+
+    snap = projects.snapshot(project_id)
+    resolved_ff = resolve_h3_spec_reference_sources(snap, spec_ff)
+    assert [r["id"] for r in resolved_ff["referenceSources"]] == [str(img_a.id)]
+    assert [r["tag"] for r in h3_reference_ordinals(resolved_ff["referenceSources"])] == ["<Picture 1>"]
+
+    # 2. Hidden parent group excludes child video items from default canvas storyboard.audit
+    hidden_group_id, hidden_spec_id, hidden_item_id = uuid4(), uuid4(), uuid4()
+    projects.execute(parse_command({
+        "type": "canvas.show",
+        "projectId": project_id,
+        "commandId": uuid4(),
+        "payload": {
+            "item": {
+                "id": str(hidden_group_id),
+                "projectId": str(project_id),
+                "kind": "group",
+                "position": {"x": 400, "y": 0},
+                "width": 400,
+                "height": 300,
+                "title": "Archived Shots",
+            },
+        },
+    }), session=session)
+    projects.execute(parse_command({
+        "type": "canvas.createGeneration",
+        "projectId": project_id,
+        "commandId": uuid4(),
+        "payload": {
+            "spec": {
+                "id": str(hidden_spec_id),
+                "projectId": str(project_id),
+                "kind": "video",
+                "purpose": "generation",
+                "modelConfigId": model_id,
+                "prompt": "Broken hidden draft",
+                "parameters": {"videoMode": "first_frame", "durationSeconds": 5},
+            },
+            "item": {
+                "id": str(hidden_item_id),
+                "projectId": str(project_id),
+                "kind": "video",
+                "parentId": str(hidden_group_id),
+                "visible": True,
+                "position": {"x": 420, "y": 40},
+                "binding": {"role": "generation", "objectRef": {"id": str(hidden_spec_id)}},
+            },
+            "references": [],
+        },
+    }), session=session)
+    projects.execute(parse_command({
+        "type": "canvas.hide",
+        "projectId": project_id,
+        "commandId": uuid4(),
+        "expectedVersions": [{"objectType": "canvas_item", "id": str(hidden_group_id), "revision": 1}],
+        "payload": {"itemId": str(hidden_group_id)},
+    }), session=session)
+
+    audit = audit_project_storyboard(projects.snapshot(project_id))
+    assert [shot["specId"] for shot in audit["shots"]] == [str(spec_ff)]
+    assert audit["valid"] is True
+
+    # 3. Repeated timeline shot revision on the same (slotId, sourceId) preserves existing connection ID
+    src_img_item = uuid4()
+    projects.execute(parse_command({
+        "type": "canvas.show",
+        "projectId": project_id,
+        "commandId": uuid4(),
+        "payload": {
+            "item": {
+                "id": str(src_img_item),
+                "projectId": str(project_id),
+                "kind": "image",
+                "position": {"x": 0, "y": 320},
+                "binding": {
+                    "role": "material",
+                    "objectRef": {"assetId": str(img_a.id), "revision": img_a.revision, "fingerprint": img_a.fingerprint, "kind": "image"},
+                },
+            },
+        },
+    }), session=session)
+    conn_id = str(uuid4())
+    tl_doc_id = uuid4()
+    tl_create = projects.execute(parse_command({
+        "type": "editor.create",
+        "projectId": project_id,
+        "commandId": uuid4(),
+        "payload": {
+            "document": {
+                "id": str(tl_doc_id),
+                "projectId": str(project_id),
+                "kind": "timeline",
+                "inputConnections": [{
+                    "id": conn_id,
+                    "sourceId": str(src_img_item),
+                    "slotId": "slot-1",
+                    "asset": {"assetId": str(img_a.id), "revision": img_a.revision, "fingerprint": img_a.fingerprint, "kind": "image"},
+                }],
+                "data": {
+                    "fps": 24,
+                    "width": 320,
+                    "height": 240,
+                    "tracks": [{
+                        "id": "v1",
+                        "kind": "visual",
+                        "title": "Main",
+                        "clips": [{
+                            "id": "slot-1",
+                            "resource": {
+                                "asset": {"assetId": str(img_a.id), "revision": img_a.revision, "fingerprint": img_a.fingerprint, "kind": "image"},
+                                "title": "a.png",
+                                "durationSeconds": None,
+                            },
+                            "inPoint": 0.0,
+                            "outPoint": 5.0,
+                        }],
+                    }],
+                    "importedAssets": [{
+                        "asset": {"assetId": str(img_a.id), "revision": img_a.revision, "fingerprint": img_a.fingerprint, "kind": "image"},
+                        "title": "a.png",
+                        "durationSeconds": None,
+                    }],
+                },
+            },
+        },
+    }), session=session)
+    assert tl_create.status == "applied", tl_create
+    local.release(session)
+
+    prepared = prepare_timeline_shot_revision(
+        projects.snapshot(project_id).model_dump(mode="json"),
+        timeline_editor_id=tl_doc_id,
+        clip_id="slot-1",
+        asset_id=img_b.id,
+        source_item_id=src_img_item,
+    )
+    assert prepared["document"]["inputConnections"][0]["id"] == conn_id

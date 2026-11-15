@@ -514,62 +514,6 @@ def video_create(ctx: typer.Context,
                    "command": shlex.join(submit)}})
 
 
-def _resolve_spec_reference_sources(snapshot: dict, spec_id: str) -> tuple[list[dict], list[str]]:
-    assets_by_id = {asset["id"]: asset for asset in snapshot.get("assets", ())}
-    items_by_id = {item["id"]: item for item in snapshot.get("canvasItems", ())}
-    specs_by_id = {spec["id"]: spec for spec in snapshot.get("generationSpecs", ())}
-    results_by_id = {res["id"]: res for res in snapshot.get("results", ())}
-    docs_by_id = {doc["id"]: doc for doc in snapshot.get("editorDocuments", ())}
-
-    def item_assets(item: dict) -> list[dict]:
-        if item["kind"] == "subject":
-            doc = docs_by_id.get(item["binding"]["objectRef"]["id"])
-            if not doc:
-                return []
-            data = doc["data"]
-            refs = [r for r in (data.get("main"), *(data.get("auxiliaries") or ()), data.get("voice")) if r]
-            return [assets_by_id[r["assetId"]] for r in refs if r["assetId"] in assets_by_id]
-        binding = item["binding"]
-        if binding["role"] == "material":
-            found = assets_by_id.get(binding["objectRef"]["assetId"])
-            return [found] if found else []
-        if binding["role"] == "generation":
-            if binding.get("materialOverride"):
-                found = assets_by_id.get(binding["materialOverride"]["assetId"])
-                return [found] if found else []
-            src_spec = specs_by_id.get(binding["objectRef"]["id"])
-            if src_spec and src_spec.get("currentResultId"):
-                res = results_by_id.get(src_spec["currentResultId"])
-                if res and res["asset"]["assetId"] in assets_by_id:
-                    return [assets_by_id[res["asset"]["assetId"]]]
-        return []
-
-    active = sorted(
-        (ref for ref in snapshot.get("references", ()) if ref.get("active") and ref.get("targetSpecId") == spec_id),
-        key=lambda ref: (ref.get("order", 0), ref.get("id", "")),
-    )
-    sources: list[dict] = []
-    roles: list[str] = []
-    for ref in active:
-        roles.append(str(ref.get("role") or "reference"))
-        if ref.get("binding") == "pinned":
-            asset_obj = assets_by_id.get(ref["source"]["assetId"])
-            resolved = [asset_obj] if asset_obj else []
-        else:
-            src_item = items_by_id.get(ref["source"]["id"])
-            resolved = item_assets(src_item) if src_item else []
-        for asset_obj in resolved:
-            if asset_obj["kind"] in {"image", "video", "audio"}:
-                sources.append({
-                    "id": asset_obj["id"],
-                    "name": asset_obj["name"],
-                    "kind": asset_obj["kind"],
-                    "role": ref.get("role"),
-                    "hasAudio": bool(asset_obj.get("metadata", {}).get("hasAudio")),
-                })
-    return sources, roles
-
-
 @group("video").command("compile-h3-prompt", help="Compile structured shot/reference JSON into an official MiniMax-H3 prompt.")
 def video_compile_h3_prompt(
     file: Annotated[Path, typer.Option(help="JSON specification file; use - for stdin.")],
@@ -590,34 +534,26 @@ def video_lint_h3_prompt(
     mode: Annotated[str | None, typer.Option(help="H3 mode: t2va, i2va, fl2va, l2va, or ref2va. Inferred when --spec-id is given.")] = None,
     duration: Annotated[float | None, typer.Option(min=0, help="Target video duration in seconds.")] = None,
 ):
+    from opendirector.application.creation_storyboard import resolve_h3_spec_reference_sources
+    from opendirector.domain.creation.validation import ContractError
     from opendirector.domain.h3_cinematography import h3_reference_ordinals, lint_h3_prompt
     if bool(spec_id) == bool(file):
-        raise ProjectError("Provide exactly one of --spec-id or --file.")
+        raise ProjectError("请提供 --spec-id 或 --file 其中之一。", 422)
     reference_sources = None
     if spec_id is not None:
         client = ctx.obj
         client.command = ctx.command_path
         snapshot = client.snapshot()
-        spec = next((s for s in snapshot.get("generationSpecs", ()) if s["id"] == str(spec_id)), None)
-        if spec is None or spec.get("kind") != "video":
-            raise ProjectError(f"Video GenerationSpec {spec_id} is not in this project.")
-        prompt_text = str(spec.get("prompt") or "")
-        effective_duration = float(duration if duration is not None else (spec.get("parameters", {}).get("durationSeconds") or 5.0))
-        reference_sources, roles = _resolve_spec_reference_sources(snapshot, str(spec_id))
-        if mode is None:
-            vmode = spec.get("parameters", {}).get("videoMode")
-            if vmode == "reference":
-                effective_mode = "ref2va"
-            elif "first_frame" in roles and "last_frame" in roles:
-                effective_mode = "fl2va"
-            elif "first_frame" in roles:
-                effective_mode = "i2va"
-            elif "last_frame" in roles:
-                effective_mode = "l2va"
-            else:
-                effective_mode = "t2va"
-        else:
-            effective_mode = mode
+        try:
+            resolved = resolve_h3_spec_reference_sources(snapshot, spec_id)
+        except ContractError as exc:
+            raise ProjectError(exc.issue.message, 404) from None
+        spec = resolved["spec"]
+        prompt_text = str(spec.prompt or "")
+        effective_duration = float(duration if duration is not None else (spec.parameters.durationSeconds or 5.0))
+        h3_mode = resolved["h3Mode"]
+        reference_sources = resolved["referenceSources"] if h3_mode != "continuation" else None
+        effective_mode = mode if mode is not None else ("i2va" if h3_mode == "continuation" else h3_mode)
     else:
         prompt_text = sys.stdin.read() if str(file) == "-" else file.read_text(encoding="utf-8")
         effective_mode = mode or "t2va"

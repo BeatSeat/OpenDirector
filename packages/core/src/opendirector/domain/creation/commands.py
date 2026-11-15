@@ -502,8 +502,17 @@ class StoryboardAuditQuery(QueryBase):
     timelineEditorId: UUID | None = Field(default=None, description='Optional timeline editor document ID to order and scope shots.')
     groupId: UUID | None = Field(default=None, description='Optional canvas group item ID to scope shots.')
     specIds: tuple[UUID, ...] | None = Field(
-        default=None, max_length=200, description='Optional explicit ordered video GenerationSpec IDs to audit.'
+        default=None, min_length=1, max_length=200, description='Optional explicit ordered video GenerationSpec IDs to audit.'
     )
+
+    @model_validator(mode='after')
+    def scope_and_unique_specs(self):
+        if self.specIds is not None:
+            unique(self.specIds, 'audited video configuration IDs')
+        scopes = sum(value is not None for value in (self.timelineEditorId, self.groupId, self.specIds))
+        if scopes > 1:
+            raise ValueError('Choose at most one storyboard audit scope: timelineEditorId, groupId, or specIds')
+        return self
 
 
 Query = Annotated[ProjectQuery | ObjectQuery | VersionsQuery | AssetSearchQuery | AssetUsageQuery |

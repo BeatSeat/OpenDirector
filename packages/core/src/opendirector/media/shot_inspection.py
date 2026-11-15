@@ -69,7 +69,7 @@ def _write_exclusive_bytes(destination: Path, payload: bytes) -> None:
     try:
         fd = os.open(destination, flags, 0o600)
     except FileExistsError:
-        raise ProjectError(f"Output file already exists: {destination}", 409) from None
+        raise ProjectError(f"联系表输出文件已存在：{destination}", 409) from None
     with os.fdopen(fd, "wb") as handle:
         handle.write(payload)
         handle.flush()
@@ -170,9 +170,9 @@ def inspect_video_shot(
 ) -> dict:
     """Probe a video file and optionally render a timestamped JPEG contact sheet."""
     if not video_path.is_file():
-        raise ProjectError(f"Video file does not exist: {video_path}", 404)
+        raise ProjectError(f"视频文件不存在：{video_path}", 404)
     if columns < 1 or columns > 8 or rows < 1 or rows > 8:
-        raise ProjectError("Contact sheet grid dimensions must be between 1 and 8.", 422)
+        raise ProjectError("联系表网格行列数必须在 1 到 8 之间。", 422)
 
     technical = _probe_streams(video_path)
     if contact_sheet_path is None:
@@ -183,7 +183,7 @@ def inspect_video_shot(
             "measuredFacts": _compute_measured_facts(technical, None),
         }
     if not overwrite_cache and contact_sheet_path.exists():
-        raise ProjectError(f"Output file already exists: {contact_sheet_path}", 409)
+        raise ProjectError(f"联系表输出文件已存在：{contact_sheet_path}", 409)
 
     total_tiles = columns * rows
     timestamps = _sample_timestamps(technical["durationSeconds"], total_tiles, technical["fps"])

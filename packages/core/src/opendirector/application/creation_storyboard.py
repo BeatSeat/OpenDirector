@@ -5,38 +5,36 @@ import json
 import re
 from uuid import UUID, uuid4, uuid5
 
-from opendirector.application.creation_canvas import current_asset
+from opendirector.application.creation_canvas import current_asset, visible_item_ids
 from opendirector.domain.creation.editors import SubjectDocument, TimelineDocument
 from opendirector.domain.creation.generation import FollowingReference
 from opendirector.domain.creation.project import ProjectSnapshot
 from opendirector.domain.creation.validation import ContractError
 from opendirector.domain.h3_cinematography import (
-    CAMERA_MOTIONS,
     SHOT_SIZES,
+    detect_camera_motions,
     h3_reference_ordinals,
     lint_h3_prompt,
     lint_shot_plan,
+    strip_dialogue_blocks,
 )
 from opendirector.domain.projects import ProjectError
+from opendirector.domain.rule_facts import TIMELINE_DURATION_EPSILON
 
 
 _SORTED_SHOT_SIZES = tuple(sorted(SHOT_SIZES, key=len, reverse=True))
-_SORTED_CAMERA_MOTIONS = tuple(sorted(CAMERA_MOTIONS, key=len, reverse=True))
 
 
 def extract_prompt_shot_features(prompt: str) -> dict[str, str | None]:
     """Extract primary canonical H3 shot size and camera motion from prompt text."""
-    text = prompt or ""
+    scrubbed = strip_dialogue_blocks(prompt or "")
     found_size = None
     for candidate in _SORTED_SHOT_SIZES:
-        if re.search(rf"(?<![A-Za-z]){re.escape(candidate)}(?![A-Za-z])", text, flags=re.IGNORECASE):
+        if re.search(rf"(?<![A-Za-z]){re.escape(candidate)}(?![A-Za-z])", scrubbed, flags=re.IGNORECASE):
             found_size = candidate
             break
-    found_motion = None
-    for candidate in _SORTED_CAMERA_MOTIONS:
-        if re.search(rf"(?<![A-Za-z]){re.escape(candidate)}(?![A-Za-z])", text, flags=re.IGNORECASE):
-            found_motion = candidate
-            break
+    motions = detect_camera_motions(scrubbed)
+    found_motion = motions[0] if motions else None
     return {"shotSize": found_size, "cameraMotion": found_motion}
 
 
@@ -76,6 +74,142 @@ def _continuation_depth(snapshot: ProjectSnapshot, spec_id: UUID) -> int:
                 continue
         break
     return depth
+
+
+def _is_visible_descendant_of_group(item, group_id: UUID, items_by_id: dict[UUID, object]) -> bool:
+    if not item.visible:
+        return False
+    seen: set[UUID] = set()
+    parent_id = getattr(item, "parentId", None)
+    while parent_id is not None and parent_id not in seen:
+        if parent_id == group_id:
+            return True
+        seen.add(parent_id)
+        parent = items_by_id.get(parent_id)
+        if parent is None or not parent.visible:
+            return False
+        parent_id = getattr(parent, "parentId", None)
+    return False
+
+
+def resolve_h3_spec_reference_sources(snapshot: ProjectSnapshot | dict, spec_id: UUID) -> dict:
+    """Resolve transmitted H3 reference sources for a video spec using shared ordering and policy."""
+    snap = ProjectSnapshot.model_validate(snapshot) if isinstance(snapshot, dict) else snapshot
+    spec = next((s for s in snap.generationSpecs if s.id == spec_id), None)
+    if spec is None or spec.kind != "video":
+        raise ContractError("missing_object", "未找到指定的视频生成配置。", spec_id)
+
+    assets_by_id = {asset.id: asset for asset in snap.assets}
+    items_by_id = {item.id: item for item in snap.canvasItems}
+    docs_by_id = {doc.id: doc for doc in snap.editorDocuments}
+
+    mentioned = list(dict.fromkeys(
+        part.referenceId for part in (spec.promptContent or ()) if part.type == "reference"
+    ))
+    active_refs = sorted(
+        (ref for ref in snap.references if ref.active and ref.targetSpecId == spec.id),
+        key=lambda ref: (
+            mentioned.index(ref.id) if ref.id in mentioned else len(mentioned),
+            ref.order,
+            str(ref.id),
+        ),
+    )
+
+    roles: list[str] = []
+    subject_item_ids: list[str] = []
+    missing_upstream: list[dict] = []
+    frame_fingerprints: dict[str, str] = {}
+    raw_candidates: list[tuple[object, str, str | None]] = []
+
+    for ref in active_refs:
+        roles.append(ref.role)
+        if ref.binding == "pinned":
+            asset_obj = assets_by_id.get(ref.source.assetId)
+            if asset_obj is None:
+                missing_upstream.append({"referenceId": str(ref.id), "role": ref.role, "reason": "missing_asset"})
+            else:
+                raw_candidates.append((asset_obj, ref.role, ref.subjectRole))
+                if ref.role in {"first_frame", "last_frame"} and ref.subjectRole is None and asset_obj.kind == "image":
+                    frame_fingerprints[ref.role] = asset_obj.fingerprint
+        else:
+            src_item = items_by_id.get(ref.source.id)
+            if src_item is None:
+                missing_upstream.append({"referenceId": str(ref.id), "role": ref.role, "reason": "missing_item"})
+                continue
+            if src_item.kind == "subject":
+                subject_item_ids.append(str(src_item.id))
+                sub_doc = docs_by_id.get(src_item.binding.objectRef.id)
+                if not isinstance(sub_doc, SubjectDocument) or sub_doc.data.main is None:
+                    missing_upstream.append({
+                        "referenceId": str(ref.id),
+                        "sourceItemId": str(src_item.id),
+                        "role": ref.role,
+                        "reason": "empty_subject",
+                    })
+                    continue
+                slot_pairs = [
+                    (sub_doc.data.main, "main"),
+                    *((aux, "auxiliary") for aux in sub_doc.data.auxiliaries),
+                    *([(sub_doc.data.voice, "voice")] if sub_doc.data.voice else []),
+                ]
+                for slot_ref, slot_role in slot_pairs:
+                    asset_obj = assets_by_id.get(slot_ref.assetId)
+                    if asset_obj is not None:
+                        raw_candidates.append((asset_obj, ref.role, slot_role))
+            else:
+                asset_obj = current_asset(snap, src_item)
+                if asset_obj is None:
+                    missing_upstream.append({
+                        "referenceId": str(ref.id),
+                        "sourceItemId": str(src_item.id),
+                        "role": ref.role,
+                        "reason": "unrendered_upstream_node",
+                    })
+                else:
+                    raw_candidates.append((asset_obj, ref.role, None))
+                    if ref.role in {"first_frame", "last_frame"} and asset_obj.kind == "image":
+                        frame_fingerprints[ref.role] = asset_obj.fingerprint
+
+    video_mode = getattr(spec.parameters, "videoMode", None)
+    selected_frame = any(role in {"first_frame", "last_frame"} for role in roles)
+    ref_sources: list[dict] = []
+    seen_asset_ids: set[str] = set()
+
+    for asset_obj, role, subject_role in raw_candidates:
+        if asset_obj.kind not in {"image", "video", "audio"}:
+            continue
+        if video_mode == "first_frame":
+            ignored = (
+                asset_obj.kind != "image"
+                or subject_role is not None
+                or not selected_frame
+                or role not in {"first_frame", "last_frame"}
+            )
+            if ignored:
+                continue
+        if video_mode == "continuation" and subject_role is not None and asset_obj.kind == "video":
+            continue
+        asset_id_str = str(asset_obj.id)
+        if asset_id_str in seen_asset_ids:
+            continue
+        seen_asset_ids.add(asset_id_str)
+        ref_sources.append({
+            "id": asset_id_str,
+            "name": asset_obj.name,
+            "kind": asset_obj.kind,
+            "role": role,
+            "hasAudio": bool(asset_obj.metadata.hasAudio),
+        })
+
+    return {
+        "spec": spec,
+        "h3Mode": _infer_h3_mode(video_mode, roles),
+        "roles": roles,
+        "referenceSources": ref_sources,
+        "subjectItemIds": subject_item_ids,
+        "missingUpstream": missing_upstream,
+        "frameFingerprints": frame_fingerprints,
+    }
 
 
 def audit_project_storyboard(
@@ -144,12 +278,15 @@ def audit_project_storyboard(
                 raise ContractError("missing_object", "未找到指定的画布分组节点。", group_id)
             candidate_items = [
                 item for item in snapshot.canvasItems
-                if item.parentId == group_id and item.kind == "video" and item.binding.role == "generation"
+                if _is_visible_descendant_of_group(item, group_id, items_by_id)
+                and item.kind == "video"
+                and item.binding.role == "generation"
             ]
         else:
+            visible = visible_item_ids(snapshot)
             candidate_items = [
                 item for item in snapshot.canvasItems
-                if item.visible and item.kind == "video" and item.binding.role == "generation"
+                if item.id in visible and item.kind == "video" and item.binding.role == "generation"
             ]
         candidate_items.sort(key=lambda item: (item.position.y, item.position.x, str(item.id)))
         for item in candidate_items:
@@ -164,86 +301,17 @@ def audit_project_storyboard(
 
     for index, spec in enumerate(ordered_specs, start=1):
         canvas_item = item_by_spec.get(spec.id)
-        active_refs = sorted(
-            (ref for ref in snapshot.references if ref.active and ref.targetSpecId == spec.id),
-            key=lambda ref: (ref.order, str(ref.id)),
-        )
-        roles: list[str] = []
-        ref_sources: list[dict] = []
-        subject_item_ids: list[str] = []
-        missing_upstream: list[dict] = []
-        frame_fingerprints: dict[str, str] = {}
-
-        for ref in active_refs:
-            roles.append(ref.role)
-            if ref.binding == "pinned":
-                asset_obj = assets_by_id.get(ref.source.assetId)
-                if asset_obj is None:
-                    missing_upstream.append({"referenceId": str(ref.id), "role": ref.role, "reason": "missing_asset"})
-                elif asset_obj.kind in {"image", "video", "audio"}:
-                    ref_sources.append({
-                        "id": str(asset_obj.id),
-                        "name": asset_obj.name,
-                        "kind": asset_obj.kind,
-                        "role": ref.role,
-                        "hasAudio": bool(asset_obj.metadata.hasAudio),
-                    })
-                    if ref.role in {"first_frame", "last_frame"}:
-                        frame_fingerprints[ref.role] = asset_obj.fingerprint
-            else:
-                src_item = items_by_id.get(ref.source.id)
-                if src_item is None:
-                    missing_upstream.append({"referenceId": str(ref.id), "role": ref.role, "reason": "missing_item"})
-                    continue
-                if src_item.kind == "subject":
-                    subject_item_ids.append(str(src_item.id))
-                    sub_doc = docs_by_id.get(src_item.binding.objectRef.id)
-                    if not isinstance(sub_doc, SubjectDocument) or sub_doc.data.main is None:
-                        missing_upstream.append({
-                            "referenceId": str(ref.id),
-                            "sourceItemId": str(src_item.id),
-                            "role": ref.role,
-                            "reason": "empty_subject",
-                        })
-                        continue
-                    slot_refs = [r for r in (sub_doc.data.main, *sub_doc.data.auxiliaries, sub_doc.data.voice) if r]
-                    for slot in slot_refs:
-                        asset_obj = assets_by_id.get(slot.assetId)
-                        if asset_obj and asset_obj.kind in {"image", "video", "audio"}:
-                            ref_sources.append({
-                                "id": str(asset_obj.id),
-                                "name": asset_obj.name,
-                                "kind": asset_obj.kind,
-                                "role": ref.role,
-                                "hasAudio": bool(asset_obj.metadata.hasAudio),
-                            })
-                else:
-                    asset_obj = current_asset(snapshot, src_item)
-                    if asset_obj is None:
-                        missing_upstream.append({
-                            "referenceId": str(ref.id),
-                            "sourceItemId": str(src_item.id),
-                            "role": ref.role,
-                            "reason": "unrendered_upstream_node",
-                        })
-                    elif asset_obj.kind in {"image", "video", "audio"}:
-                        ref_sources.append({
-                            "id": str(asset_obj.id),
-                            "name": asset_obj.name,
-                            "kind": asset_obj.kind,
-                            "role": ref.role,
-                            "hasAudio": bool(asset_obj.metadata.hasAudio),
-                        })
-                        if ref.role in {"first_frame", "last_frame"}:
-                            frame_fingerprints[ref.role] = asset_obj.fingerprint
+        resolved = resolve_h3_spec_reference_sources(snapshot, spec.id)
+        ref_sources = resolved["referenceSources"]
+        subject_item_ids = resolved["subjectItemIds"]
+        missing_upstream = resolved["missingUpstream"]
+        frame_fingerprints = resolved["frameFingerprints"]
+        h3_mode = resolved["h3Mode"]
 
         if subject_item_ids or ref_sources:
             anchored_count += 1
 
-        video_mode = getattr(spec.parameters, "videoMode", None)
         duration = float(getattr(spec.parameters, "durationSeconds", None) or 5.0)
-        generate_audio = bool(getattr(spec.parameters, "generateAudio", True))
-        h3_mode = _infer_h3_mode(video_mode, roles)
         continuity_issues: list[str] = []
         continuity_warnings: list[str] = []
 
@@ -418,40 +486,36 @@ def prepare_timeline_shot_revision(
         None,
     )
     if doc is None:
-        raise ProjectError(f"Timeline editor document {timeline_editor_id} is not in this project.")
+        raise ProjectError("未找到指定的时间线文档。", 404)
 
     if source_item_id is not None and not any(
         item["id"] == str(source_item_id) for item in snapshot.get("canvasItems", ())
     ):
-        raise ProjectError(f"Source canvas item {source_item_id} is not in this project.")
+        raise ProjectError("未找到指定的来源画布节点。", 404)
 
     resolved_clip_id = clip_id
     if resolved_clip_id is None:
         if source_item_id is None:
-            raise ProjectError("Provide --clip-id or --source-item linked in timeline inputConnections.")
+            raise ProjectError("请提供 --clip-id，或提供已关联到时间线槽位的 --source-item。", 422)
         matched = next(
             (c["slotId"] for c in (doc.get("inputConnections") or ()) if c["sourceId"] == str(source_item_id)),
             None,
         )
         if matched is None:
-            raise ProjectError(
-                f"Source canvas item {source_item_id} is not linked to any slot in timeline {timeline_editor_id}."
-            )
+            raise ProjectError("来源画布节点尚未关联到当前时间线的任何槽位。", 422)
         resolved_clip_id = matched
 
     resolved_asset_id = str(asset_id) if asset_id is not None else None
     if resolved_asset_id is None:
         if source_item_id is None:
-            raise ProjectError("Provide --asset or a --source-item with an adopted/material asset.")
+            raise ProjectError("请提供 --asset，或提供已有采纳结果或素材的 --source-item。", 422)
         resolved_asset_id = _resolve_item_adopted_asset_id(snapshot, str(source_item_id))
         if resolved_asset_id is None:
-            raise ProjectError(
-                f"Source canvas item {source_item_id} has no adopted result or material asset to sync."
-            )
+            raise ProjectError("来源画布节点尚无已采纳结果或可用素材。", 422)
 
     asset_obj = next((a for a in snapshot.get("assets", ()) if a["id"] == resolved_asset_id), None)
     if asset_obj is None:
-        raise ProjectError(f"Asset {resolved_asset_id} is not registered in this project.")
+        raise ProjectError("替换素材未在当前项目中注册。", 404)
 
     updated_doc = json.loads(json.dumps(doc))
     target_track = None
@@ -464,13 +528,13 @@ def prepare_timeline_shot_revision(
         if target_clip is not None:
             break
     if target_clip is None or target_track is None:
-        raise ProjectError(f"Clip '{resolved_clip_id}' was not found in timeline {timeline_editor_id}.")
+        raise ProjectError(f"未在时间线中找到片段 '{resolved_clip_id}'。", 404)
 
     media_kind = asset_obj["kind"]
     if target_track["kind"] == "visual" and media_kind not in {"image", "video"}:
-        raise ProjectError("Visual timeline clips require an image or video asset.")
+        raise ProjectError("画面轨道片段只能使用图片或视频素材。", 422)
     if target_track["kind"] == "audio" and media_kind != "audio":
-        raise ProjectError("Audio timeline clips require an audio asset.")
+        raise ProjectError("音频轨道片段只能使用音频素材。", 422)
 
     old_asset_id = target_clip["resource"]["asset"]["assetId"]
     old_in = float(target_clip["inPoint"])
@@ -482,7 +546,7 @@ def prepare_timeline_shot_revision(
         new_out = float(out_point) if out_point is not None else (old_out - old_in)
     else:
         if asset_duration is None or float(asset_duration) <= 0:
-            raise ProjectError("Video and audio timeline replacements require a probed positive durationSeconds.")
+            raise ProjectError("替换时间线视频或音频需要已知的正数素材时长。", 422)
         total_dur = float(asset_duration)
         new_in = (
             float(in_point)
@@ -497,8 +561,8 @@ def prepare_timeline_shot_revision(
             new_out = min(total_dur, new_in + (old_out - old_in))
             if new_out <= new_in:
                 new_in, new_out = 0.0, total_dur
-        if new_out <= new_in or new_out > total_dur + 1e-6:
-            raise ProjectError(f"Invalid trim [{new_in}, {new_out}] for asset duration {total_dur}s.")
+        if new_out <= new_in or new_out > total_dur + TIMELINE_DURATION_EPSILON:
+            raise ProjectError(f"裁剪区间 [{new_in}, {new_out}] 超出素材时长 {total_dur} 秒。", 422)
 
     new_asset_ref = {
         "assetId": asset_obj["id"],
@@ -526,18 +590,21 @@ def prepare_timeline_shot_revision(
 
     operation = operation_id or uuid4()
     existing_conns = updated_doc.get("inputConnections") or []
-    effective_source_id = str(source_item_id) if source_item_id is not None else next(
-        (c["sourceId"] for c in existing_conns if c["slotId"] == resolved_clip_id),
-        None,
+    existing_for_slot = next((c for c in existing_conns if c["slotId"] == resolved_clip_id), None)
+    effective_source_id = str(source_item_id) if source_item_id is not None else (
+        existing_for_slot["sourceId"] if existing_for_slot is not None else None
     )
     connections = [c for c in existing_conns if c["slotId"] != resolved_clip_id]
     if effective_source_id is not None:
         if any(c["sourceId"] == effective_source_id for c in connections):
-            raise ProjectError(
-                f"Source canvas item {effective_source_id} is already connected to another timeline slot."
-            )
+            raise ProjectError("来源画布节点已连接到当前时间线的其他槽位。", 409)
+        conn_id = (
+            existing_for_slot["id"]
+            if existing_for_slot is not None and existing_for_slot.get("sourceId") == effective_source_id
+            else str(uuid5(operation, f"connection-{resolved_clip_id}"))
+        )
         connections.append({
-            "id": str(uuid5(operation, f"connection-{resolved_clip_id}")),
+            "id": conn_id,
             "sourceId": effective_source_id,
             "slotId": resolved_clip_id,
             "asset": new_asset_ref,
