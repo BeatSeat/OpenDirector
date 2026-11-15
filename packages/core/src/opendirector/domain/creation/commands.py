@@ -487,10 +487,27 @@ class CanvasStatusQuery(QueryBase):
 class AssetPreviewQuery(QueryBase):
     type: Literal['asset.preview'] = Field(description='Preview an asset; does not establish model observation.')
     objectId: UUID = Field(description='Asset ID.')
+    videoScope: Literal['first_frame', 'contact_sheet'] = Field(
+        default='first_frame',
+        description='Video preview mode: single first frame or multi-frame timestamped contact sheet.',
+    )
+    columns: int = Field(default=4, strict=True, ge=1, le=8, description='Contact-sheet grid columns for videoScope="contact_sheet".')
+    rows: int = Field(default=3, strict=True, ge=1, le=8, description='Contact-sheet grid rows for videoScope="contact_sheet".')
+
+
+class StoryboardAuditQuery(QueryBase):
+    type: Literal['storyboard.audit'] = Field(
+        description='Audit multi-shot continuity, H3 prompt/ordinal alignment, diversity, and pilot-gate readiness.'
+    )
+    timelineEditorId: UUID | None = Field(default=None, description='Optional timeline editor document ID to order and scope shots.')
+    groupId: UUID | None = Field(default=None, description='Optional canvas group item ID to scope shots.')
+    specIds: tuple[UUID, ...] | None = Field(
+        default=None, max_length=200, description='Optional explicit ordered video GenerationSpec IDs to audit.'
+    )
 
 
 Query = Annotated[ProjectQuery | ObjectQuery | VersionsQuery | AssetSearchQuery | AssetUsageQuery |
-                  CanvasStatusQuery | AssetPreviewQuery, Field(discriminator='type')]
+                  CanvasStatusQuery | AssetPreviewQuery | StoryboardAuditQuery, Field(discriminator='type')]
 
 
 class ChangedObject(Contract):
