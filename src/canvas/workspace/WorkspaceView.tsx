@@ -36,7 +36,7 @@ import { REFERENCE_PORT_ICON_SIZE, REFERENCE_PORT_SIZE, referencePortDirection, 
 import { batchCreationKinds, SELECTION_PADDING, SELECTION_PORT_SIZE } from "../selectionReferences";
 
 import "../multi-selection.css";
-import { CreationRipples } from "../CreationRipples";
+import { CreationRipples } from "../CreationRipples.tsx";
 import { canvasDotGrid } from "../creationRipples.ts";
 import "../node-reference-ports.css";
 import "../control-theme.css";
