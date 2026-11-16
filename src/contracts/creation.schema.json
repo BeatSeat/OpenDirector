@@ -12848,6 +12848,20 @@
             "title": "Outputid",
             "type": "string"
           },
+          "expectedOutputRevision": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Current output node revision when appending a rendered version.",
+            "title": "Expectedoutputrevision"
+          },
           "title": {
             "default": "合成视频",
             "description": "User-visible title.",
@@ -28450,6 +28464,20 @@
             "format": "uuid",
             "title": "Outputid",
             "type": "string"
+          },
+          "expectedOutputRevision": {
+            "anyOf": [
+              {
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Current output node revision when appending a rendered version.",
+            "title": "Expectedoutputrevision"
           },
           "title": {
             "default": "合成视频",

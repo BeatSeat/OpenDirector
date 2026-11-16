@@ -1352,6 +1352,7 @@ export interface TimelinePublishRenderInput extends ContractInput {
   readonly editorId: string;
   readonly asset: AssetRefInput;
   readonly outputId: string;
+  readonly expectedOutputRevision?: number | null;
   readonly title?: string;
   readonly position?: PointInput;
 }
@@ -2927,6 +2928,7 @@ export interface TimelinePublishRender extends Contract {
   readonly editorId: string;
   readonly asset: AssetRef;
   readonly outputId: string;
+  readonly expectedOutputRevision?: number | null;
   readonly title: string;
   readonly position: Point;
 }
