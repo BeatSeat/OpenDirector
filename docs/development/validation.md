@@ -465,6 +465,37 @@ node tests/browser/provider_settings.mjs
 
 浏览器用例使用隔离服务验证提供商预设、手动添加、逐模型图片输入能力、保存不推理、已有连接复用及取消草稿。不会向外部提供商发送请求或保存真实密钥。
 
+## 画布 Markdown 文本节点（#336）
+
+使用隔离的 API 和 Vite 运行已注册到浏览器门禁的回归；在三个终端分别执行：
+
+```sh
+# 终端 1：隔离工程存储与模型替身
+PYTHONPATH=packages/core/src:apps/api/src .venv/bin/python tests/browser/creation_server.py --port 8027
+
+# 终端 2：前端代理到隔离 API
+OPENDIRECTOR_API_URL=http://127.0.0.1:8027 npm run dev -- --port 5187
+
+# 终端 3：文本节点回归
+CREATION_WEB_URL=http://127.0.0.1:5187 node tests/browser/canvas_text_markdown.mjs
+```
+
+如使用本机安装的浏览器或 Playwright 模块，通过 `BROWSER_PATH`、`PLAYWRIGHT_MODULE` 指定路径。完整浏览器门禁使用 `npm run test:browser`，并将 `CREATION_API_URL`、`CREATION_WEB_URL` 指向同一组隔离服务。
+
+该回归验证：
+
+- 在 zoom 0.8 和 1.3 下，从未选中卡片的角落拖动并选中后立即拖拽缩放手柄，不等待选中后的视口动画结束。指针按住期间视口 transform 字符串保持不变；保存的宽高等于原尺寸加上屏幕位移除以手势开始时的 zoom，允许不超过 1 个画布单位的整数舍入误差。
+- 缩放期间没有业务写入，释放指针后只有一次提交；释放位置在手柄外也能结束交互。Escape 和 pointercancel 丢弃临时尺寸、结束历史事务并清除交互保护。正常选中仍可调整视口，手势开始会停止进行中的自动调整；手势后工具栏、生成器和键盘快捷键恢复可用。
+- 缩放只修改展示尺寸，保持文本素材不变，一次撤销／重做覆盖整个手势，重新打开工程后宽高保留。锁定文本节点不提供手柄且拒绝编辑。
+- Markdown 标题、列表、引用、强调、链接、代码块和表格的渲染，代码块语言标签的展示，以及行内输入缓冲区、全屏源码／预览、选区／光标／滚动交接和中英界面。
+
+自动化必须遵守两个运行条件：
+
+- `canvas text show` 的有界完整源码读取需要正在监听的 HTTP API，即使其他命令使用进程内或 live agent 桥接；没有监听 API 时会返回 `asset_text_api_unavailable`，提示启动 API 并检查 `OPENDIRECTOR_API_URL`。
+- 工程租约在 15 秒后过期。跨 agent 轮次的脚本必须续租，否则写入会被拒绝，错误为 `工程已关闭或会话已过期`。
+
+CLI 命令、参数和示例见 [CLI 使用说明](../guides/cli.md)。每个拉取请求的媒体、实测结果和验证范围记录在该拉取请求描述中。
+
 ## 定时文字与可移植时间线
 
 ```sh
