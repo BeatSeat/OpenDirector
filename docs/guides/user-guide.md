@@ -84,6 +84,8 @@ The canvas saves automatically. Before closing it or switching projects, check t
 3. Connect a source node that has content to the target node, or type `@` in the input field to select reference assets.
 4. Check the references and parameters, then generate. When the task finishes, view its result in the node or **Generation history**.
 
+For GPT Image models, open **Generation settings** and choose **Quality** from **Auto**, **Low**, **Medium**, or **High**. **Auto** keeps the service default. The choice is saved with the project and frozen when a task is submitted. Changing it later affects subsequent tasks. Other image services do not show this option. Standalone image tools retain their service default. The Agent can set the same value through `parameters.quality` in the image generation spec.
+
 After typing `@`, use the up and down arrow keys to select an asset, the left and right arrow keys to switch categories, `Enter` to insert, and `Esc` to close the picker. References are inserted into the text as single units. Removing the last reference to a source also removes its corresponding reference connection.
 
 When an image or video node is connected to a text node with content, the prompt may stay blank: generation uses the text as is as the prompt, and anything typed in the prompt is added to it. Connected text carries no "Reference N: title" label; only text inserted with `@` keeps its label so the inline mention points at it. One text node can feed several generation nodes that use different models, and they all pick up edits to the text. Speech and music never read text references and still need their own text or style.

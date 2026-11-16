@@ -1,6 +1,11 @@
 {
   "scripts": [
     {
+      "file": "image_quality_test.mjs",
+      "previewSafe": true,
+      "lanes": ["extended", "production"]
+    },
+    {
       "file": "heif_upload_recovery.mjs",
       "lanes": ["extended", "production"],
       "previewSafe": true,
