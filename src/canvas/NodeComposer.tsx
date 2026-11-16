@@ -11,6 +11,7 @@ import { ComposerPopover } from "./ComposerPopover";
 import { DurationControl } from "./DurationControl";
 import { ReferenceThumbnail } from "./ReferenceThumbnail";
 import {
+  h3FrameCount,
   changeGenerationSettings,
   generationBlocker,
   generationModel,
@@ -788,6 +789,8 @@ export function NodeComposer({
           placement="above-anchor"
         >
           <DurationControl
+            fractional={!!config?.inputRules.fractionalDuration}
+            outputFrames={config?.inputRules.profile === "vllm-omni-h3" ? h3FrameCount(settings.durationSeconds) : undefined}
             values={durationValues}
             value={settings.durationSeconds}
             disabled={running}
