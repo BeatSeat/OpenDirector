@@ -220,6 +220,7 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
     projectRenaming,
     projected,
     readJobs,
+    recoverServiceTask,
     ready,
     referenceEdges,
     referencePreviews,
@@ -1744,6 +1745,7 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
                 incoming={composerIncoming}
                 referenceControls={generationReferenceControls(composerNode)}
                 models={backendCatalog.models}
+                onCheckModels={backendCatalog.refreshAvailability}
                 onUpdate={(patch) =>
                   command({
                     type: "update-node",
@@ -1789,6 +1791,7 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
                 }}
                 running={composerRunning}
                 backendModels={backendCatalog.models}
+                onCheckModels={backendCatalog.refreshAvailability}
                 removeWatermark={backendCatalog.settings?.removeWatermark}
               />
             )}
@@ -2216,10 +2219,8 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
                           return;
                         }
                         {
-                          await creationClient(doc.id).control(
-                            job.taskId,
-                            action,
-                          );
+                          if (action === "recover") await recoverServiceTask(job);
+                          else await creationClient(doc.id).control(job.taskId, action);
                           return;
                         }
                       } catch (error) {
