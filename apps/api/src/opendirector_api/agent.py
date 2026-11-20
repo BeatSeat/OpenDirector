@@ -150,7 +150,7 @@ class Conversations:
                 value['messages'].append(begin)
                 value['messages'].append({'id': str(uuid5(UUID(begin['id']), 'assistant')),
                     'role': 'assistant', 'text': '', 'status': 'streaming',
-                    **{key: begin[key] for key in ('model', 'runtime') if key in begin}})
+                    **{key: begin[key] for key in ('model', 'modelIsCliDefault', 'runtime') if key in begin}})
                 value.update(draft='', draftContent=None, assets=[], skills=[])
                 changed = True
             if finish is not None:
@@ -169,9 +169,9 @@ class Conversations:
             current['conversationId'] = current.get('conversationId') or str(uuid5(project_id, 'assistant'))
             return {'activeId': current['conversationId'], 'items': [
                 {'id': item['conversationId'],
-                 'title': next((message['text'].strip().split('\n')[0][:48] or '素材对话'
+                 'title': next((message['text'].strip().split('\n')[0][:48] or None
                                 for message in item['messages'] if message['role'] == 'user'),
-                               (item.get('draft') or '').strip().split('\n')[0][:48] or '新会话'),
+                               (item.get('draft') or '').strip().split('\n')[0][:48] or None),
                  'messageCount': len(item['messages']),
                  'hasDraft': bool((item.get('draft') or '').strip() or item.get('assets') or item.get('skills'))}
                 for item in [current, *current.get('archivedConversations', [])]]}
@@ -245,7 +245,7 @@ class RunEvents:
             await self.changed.wait()
 
 
-def agent_routes(projects, generation, configs, provider=None) -> APIRouter:
+def agent_routes(projects, generation, configs, provider=None, *, active=None) -> APIRouter:
     router = APIRouter(prefix='/api/creation/projects/{project_id}/assistant')
     conversations = Conversations(projects)
     runtimes = AgentRuntimes(projects, generation, configs, provider)
@@ -282,7 +282,8 @@ def agent_routes(projects, generation, configs, provider=None) -> APIRouter:
                      errorDetails=job.errorDetails, asset=job.asset, adopted=job.adopted)
                 for job in jobs]
 
-    active: dict[UUID, tuple[UUID, asyncio.Task, RunEvents]] = {}
+    if active is None:
+        active = {}
     admission: dict[UUID, asyncio.Lock] = {}
 
     @router.get('')
@@ -394,7 +395,8 @@ def agent_routes(projects, generation, configs, provider=None) -> APIRouter:
             for asset_id in value.assets:
                 if str(asset_id) not in assets:
                     raise ProjectError('引用素材不属于当前工程。', 409)
-            model = config['modelId'] if config else (value.runtimeModel or 'CLI 默认模型')
+            model = config['modelId'] if config else value.runtimeModel
+            model_is_cli_default = spec.modelSource == 'cli' and not model
             model_selections = dict(value.modelSelections)
             model_names = {row['id']: row['modelId'] for row in configs.list()}
             preferences = {kind: {'modelConfigId': model_id, 'modelName': model_names.get(model_id)}
@@ -417,7 +419,7 @@ def agent_routes(projects, generation, configs, provider=None) -> APIRouter:
                             for asset in (assets[str(key)] for key in value.assets)],
                         'skills': value.skills, 'runtime': value.runtime, 'runtimeModel': value.runtimeModel,
                         'modelSelections': dict(value.modelSelections),
-                        'model': model, 'status': 'complete'}
+                        'model': model, 'modelIsCliDefault': model_is_cli_default, 'status': 'complete'}
                     saved = await asyncio.to_thread(conversations.update, project_id, session, begin=user,
                         conversation_id=value.conversationId, before_begin=validate_connection)
                     accepted = True
@@ -493,7 +495,7 @@ def agent_routes(projects, generation, configs, provider=None) -> APIRouter:
                                 activity['status'] = 'interrupted'
                         saved = await asyncio.to_thread(conversations.update, project_id, finish={
                             'id': str(uuid5(value.id, 'assistant')), 'role': 'assistant', 'text': text, 'status': status,
-                            'model': model,
+                            'model': model, 'modelIsCliDefault': model_is_cli_default,
                             'runtime': value.runtime, 'thinking': value.thinking, 'tools': activities,
                             'sources': list(sources.values()),
                             **({'plan': plan} if plan is not None else {})}, conversation_id=value.conversationId)

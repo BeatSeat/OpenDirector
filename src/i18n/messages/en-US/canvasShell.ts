@@ -1,9 +1,14 @@
 export const canvasShell = {
+  "desktop.sidebar.saveFailed": "Could not save the sidebar state. Your choice may not be restored after restarting.",
+  "desktop.sidebar.newProject": "New project",
+  "desktop.sidebar.toggle": "Toggle project sidebar",
+  "desktop.sidebar.projects": "Projects",
   "canvas.project.search": "Search projects",
   "canvas.project.clearSearch": "Clear search",
   "canvas.project.noSearchResults": "No matching projects",
 
   "canvas.project.defaultName": "Untitled project",
+  "canvas.project.defaultNameIndexed": "Untitled project ({index})",
   "canvas.search.label": "Search nodes",
   "canvas.search.placeholder": "Search names, prompts or text",
   "canvas.search.clear": "Clear search",

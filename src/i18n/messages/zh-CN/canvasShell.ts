@@ -1,10 +1,15 @@
 /** Canvas search, notifications, project switching and selection toolbars. */
 export const canvasShell = {
+  "desktop.sidebar.saveFailed": "无法保存侧栏开闭状态，重启后可能无法恢复本次选择。",
+  "desktop.sidebar.newProject": "新建项目",
+  "desktop.sidebar.toggle": "展开或收起项目侧栏",
+  "desktop.sidebar.projects": "项目",
   "canvas.project.search": "搜索项目",
   "canvas.project.clearSearch": "清空搜索",
   "canvas.project.noSearchResults": "没有匹配的项目",
 
   "canvas.project.defaultName": "未命名项目",
+  "canvas.project.defaultNameIndexed": "未命名项目（{index}）",
   "canvas.search.label": "搜索节点",
   "canvas.search.placeholder": "搜索名称、提示词或文本",
   "canvas.search.clear": "清空搜索",

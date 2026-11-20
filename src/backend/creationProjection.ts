@@ -1,5 +1,6 @@
 /** React Flow is a projection. These adapters translate typed editor/media
  * values; no browser URL is ever put into the authoritative project. */
+import { dataUrlToBlob } from "../canvas/downloadAssets.ts";
 import type {
   Asset,
   AssetRef,
@@ -99,12 +100,14 @@ export class CreationProjection {
   }
 
   async importFile(file: File, signal?: AbortSignal): Promise<CanvasResource> {
-    const { mimeType } = classifyImportFile(file);
-    if (mimeType !== "image/heic" && mimeType !== "image/heif")
+    const { kind, mimeType } = classifyImportFile(file);
+    if (kind !== "video" && kind !== "audio" &&
+        mimeType !== "image/heic" && mimeType !== "image/heif")
       return readEditorResource(file, signal);
     signal?.throwIfAborted();
-    const ref = await this.client.importBlob(file, file.name, "image");
+    const ref = await this.client.importBlob(file, file.name, kind, undefined, undefined, signal);
     signal?.throwIfAborted();
+    // The Host probes original bytes, so audio and video never need a data URL.
     // Failed previews must not be saved as empty generation nodes.
     await this.client.mediaUrl(ref.assetId, { signal });
     return this.resource(ref);
@@ -167,6 +170,7 @@ export class CreationProjection {
         if (!resource.src) throw new Error(tNow("errors.backend.mediaEmpty"));
         let blob: Blob;
         if (existing) blob = await this.client.blob(existing.id);
+        else if (/^data:/i.test(resource.src)) blob = dataUrlToBlob(resource.src);
         else {
           const response = await fetch(resource.src);
           if (!response.ok)
@@ -579,6 +583,7 @@ export class CreationProjection {
     const document = {
       ...createDocument(snapshot.project.name),
       id: snapshot.project.id,
+      defaultNameIndex: snapshot.project.defaultNameIndex,
     };
     const view = await this.client.view();
     document.viewport = view.viewport;

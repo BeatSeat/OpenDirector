@@ -1,3 +1,5 @@
+import { projectDisplayName } from "../projectDisplayName";
+import { DesktopSidebar } from "./DesktopSidebar";
 import { Background, BackgroundVariant, MiniMap, SelectionMode, ViewportPortal } from "@xyflow/react";
 
 import "@xyflow/react/dist/style.css";
@@ -101,6 +103,7 @@ import { TooltipButton } from "../TooltipButton";
 import { VideoActionEditor } from "../VideoActionEditor";
 import { captureVideoEndpoint, extractVideoAudio } from "../videoActionRuntime";
 import "../workspace.css";
+import "../desktop-chrome.css";
 import type { WorkspaceRuntime } from "./runtimeTypes.ts";
 import { DirectorStage, IconButton, helpShortcuts, nodeTypes, edgeTypes, referenceSideKeys, incomingNodes } from "./workspaceChrome.tsx";
 
@@ -391,6 +394,44 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
     rt.revealCreatedNodes.current([output], doc.nodes.some((node) => node.id === output.id) ? doc.nodes : [...doc.nodes, output]);
   }, [outputState?.output.id]);
 
+  const desktop = !!window.opendirectorDesktop;
+  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(() => {
+    try { return desktop && localStorage.getItem("opendirector.desktop.sidebar.v1") === "open"; }
+    catch { return false; }
+  });
+  useEffect(() => {
+    if (!desktop) return;
+    try { localStorage.setItem("opendirector.desktop.sidebar.v1", desktopSidebarOpen ? "open" : "closed"); }
+    catch { notify(t("desktop.sidebar.saveFailed")); }
+  }, [desktop, desktopSidebarOpen]);
+  const createDesktopProject = () => {
+    const id = crypto.randomUUID();
+    void switchDocument(async () => {
+      const { projects } = await listWorkspaceProjects();
+      const names = new Set(projects.map(project => project.name));
+      const base = t("canvas.project.defaultName");
+      let name = base;
+      for (let suffix = 2; names.has(name); suffix++) name = `${base} ${suffix}`;
+      const project = await createWorkspaceProject(name, id);
+      const document = await openWorkspaceProject(project);
+      await saveWorkspaceDocument(document);
+      return document;
+    }).then(success => { if (success) setEditProjectNameId(id); });
+  };
+
+  const [showSwitching, setShowSwitching] = useState(false);
+  useEffect(() => {
+    if (!switching) {
+      setShowSwitching(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setShowSwitching(true), 200);
+    return () => window.clearTimeout(timer);
+  }, [switching]);
+  const switchingStatus = switching && showSwitching
+    ? t("canvas.workspace.loading.switching")
+    : "";
+
   const workspace = (
     <div
       inert={!ready || switching}
@@ -398,6 +439,7 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
       className={`cw-workspace${panning ? " cw-workspace-panning" : ""}${spacePressed ? " cw-workspace-space-panning" : ""}`}
       ref={root}
       data-testid="canvas-workspace"
+      data-desktop-sidebar={desktop && desktopSidebarOpen ? "open" : "closed"}
       data-edge-motion={pageVisible}
       data-assistant-open={assistantOpen}
       data-assistant-resizing={assistantLayout.dragging}
@@ -883,25 +925,12 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
           <ProjectSelector
             currentId={doc.id}
             editNameForId={editProjectNameId}
-            name={doc.title}
+            name={projectDisplayName(t, doc.title, doc.defaultNameIndex)}
             disabled={!ready || switching || projectRenaming}
             onSelect={(project) =>
               switchDocument(() => openWorkspaceProject(project))
             }
-            onCreate={() => {
-              const id = crypto.randomUUID();
-              void switchDocument(async () => {
-                const { projects } = await listWorkspaceProjects();
-                const names = new Set(projects.map(project => project.name));
-                const base = t("canvas.project.defaultName");
-                let name = base;
-                for (let suffix = 2; names.has(name); suffix++) name = `${base} ${suffix}`;
-                const project = await createWorkspaceProject(name, id);
-                const document = await openWorkspaceProject(project);
-                await saveWorkspaceDocument(document);
-                return document;
-              }).then(success => { if (success) setEditProjectNameId(id); });
-            }}
+            onCreate={createDesktopProject}
             onExamples={() => void openExamplePicker()}
             onRename={renameCurrentProject}
             onRenameProject={renameProject}
@@ -933,7 +962,7 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
           <NodeInfoButton nodes={doc.nodes} />
           <span className="cw-save-status" title={saveStatusText}>
             <i className={saveStatus.state === "saved" ? "saved" : ""} />
-            {saveStatusText}
+            {desktop && desktopSidebarOpen ? saveStatusText : switchingStatus || saveStatusText}
           </span>
           {saveStatus.state === "failed" && (
             <div className="cw-save-conflict-actions">
@@ -999,6 +1028,8 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
             size={20}
             onClick={exportDocument}
           />
+          {desktop && window.opendirectorDesktop?.showMore && <IconButton name="more" label={t("common.more")} tooltipSide="bottom"
+            onClick={() => window.opendirectorDesktop?.showMore?.()} />}
           <input
             ref={importInput}
             type="file"
@@ -1012,6 +1043,14 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
           />
         </div>
       </header>
+      {desktop && <DesktopSidebar open={desktopSidebarOpen} currentId={doc.id}
+        switchingStatus={switchingStatus}
+        disabled={!ready || switching || projectRenaming}
+        onToggle={() => setDesktopSidebarOpen(value => !value)}
+        onCreate={createDesktopProject}
+        onDelete={deleteProject}
+        onSelect={project => switchDocument(() => openWorkspaceProject(project))}
+        onSettings={() => setSettingsOpen(true)} />}
       <CanvasToolRail
         holdCollapsed={false}
         items={[
@@ -2375,7 +2414,7 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
         <AssistantPanel
           key={doc.id}
           documentId={doc.id}
-          documentTitle={doc.title}
+          documentTitle={projectDisplayName(t, doc.title, doc.defaultNameIndex)}
           catalog={backendCatalog}
           nodes={[...doc.nodes, ...(doc.hiddenNodes ?? [])]}
           visibleNodes={doc.nodes}
@@ -2911,7 +2950,7 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
           onInsert={insertLibraryItems}
         />
       )}
-      {(!ready || switching) && (
+      {!ready && (
         <div className="canvas-loading-screen" role="status">
           {initializationError ? (
             <div role="alert">
@@ -2922,7 +2961,7 @@ export function WorkspaceView({ rt }: { rt: WorkspaceRuntime }) {
           ) : (
             <span className="canvas-loading-message">
               <span className="canvas-loading-spinner" aria-hidden="true" />
-              {t(switching ? "canvas.workspace.loading.switching" : "canvas.workspace.loading.opening")}
+              {t("canvas.workspace.loading.opening")}
             </span>
           )}
         </div>

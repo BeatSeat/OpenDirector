@@ -994,10 +994,12 @@ export interface ProjectInput extends ContractInput {
   readonly id: string;
   readonly revision?: number;
   readonly name: string;
+  readonly defaultNameIndex?: number | null;
 }
 
 export interface ProjectCreateInput extends ContractInput {
   readonly name: string;
+  readonly defaultNameIndex?: number | null;
 }
 
 export interface ProjectCreateCommandInput extends CommandBaseInput {
@@ -1025,7 +1027,8 @@ export interface ProjectQueryInput extends QueryBaseInput {
   readonly type: "project.get";
 }
 
-export interface ProjectRenameInput extends ProjectCreateInput {
+export interface ProjectRenameInput extends ContractInput {
+  readonly name: string;
 }
 
 export interface ProjectRenameCommandInput extends CommandBaseInput {
@@ -2637,10 +2640,12 @@ export interface Project extends Contract {
   readonly id: string;
   readonly revision: number;
   readonly name: string;
+  readonly defaultNameIndex?: number | null;
 }
 
 export interface ProjectCreate extends Contract {
   readonly name: string;
+  readonly defaultNameIndex?: number | null;
 }
 
 export interface ProjectCreateCommand extends CommandBase {
@@ -2668,7 +2673,8 @@ export interface ProjectQuery extends QueryBase {
   readonly type: "project.get";
 }
 
-export interface ProjectRename extends ProjectCreate {
+export interface ProjectRename extends Contract {
+  readonly name: string;
 }
 
 export interface ProjectRenameCommand extends CommandBase {
